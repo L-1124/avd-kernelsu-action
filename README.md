@@ -141,8 +141,9 @@ adb shell /data/adb/ksud debug info
 可通过 `adb shell 'cat /proc/kallsyms | grep -E " (kernelsu_init|ksu_cred)$"'` 进一步确认 KernelSU 符号已内置到运行中的内核。
 
 #### 4. 关于 `adb shell su -v`
-- `su` 依赖 **KernelSU 授权名单**：`adb shell` 的 uid 2000 默认不在名单内，需先在管理器界面把 `Shell` 加入允许列表。
-- 若 AVD 的 ramdisk 曾被 **Magisk** 修补过，`/system/xbin/su` 会残留非 KernelSU 的 su，从而遮蔽 `su` 查找（表现为 `su: invalid uid/gid '-v'`）。**建议使用全新未打 Magisk 的 AVD** 来获得干净的 `su` 路径。
+- **它不是有效的验证手段**：模拟器 `google_apis` 镜像自带 `/system/xbin/su`（setuid root 的 AOSP 调试 su，位于只读系统分区 `dm-5`，与 KernelSU/Magisk 无关）。该 su 只接受 `su [uid] [gid] [命令]` 形式，因此 `su -v` / `su -c id` 必然报 `su: invalid uid/gid '-v'`；而它本身是 setuid root，不经 KernelSU 也可提权，故不能用来证明 KernelSU 生效。
+- **KernelSU 的 root 由授权名单控制**：`adb shell` 的 uid 2000 默认不在名单内，需在管理器界面手动授权；普通 App 则在其首次请求 root 时由管理器弹窗授权。
+- **不要在此 AVD 上再装 Magisk**：若 `/data/adb/magisk` 存在，Magisk 注入的 su 会与 KernelSU 争夺 `su` 路径。验证 KernelSU 请使用全新未装 Magisk 的 AVD。
 
 ---
 
@@ -198,9 +199,7 @@ virtual_device_modules.tar.gz  2.2 MB  ← 45 个虚拟设备驱动（goldfish_*
 
 1. **首次开机后必须重启一次**：KernelSU 会向 `init.rc` 注入 `exec u:r:ksu:s0 root -- /data/adb/ksud ...`，而 `/data/adb/ksud` 只有在安装 Manager App 之后才会生成。因此首次开机日志会出现 `Cannot find '/data/adb/ksud'`，属正常现象；安装 Manager 后重启一次，`ksud` 即可正常工作。
 2. **Manager APK 版本可略旧于内核**：实测内核 `33310`（v3.4.0）与官方 Manager APK `33294` 握手成功（签名一致即可）。但建议尽量使用与内核同一版本系列的官方 APK。
-3. **不要在曾被 Magisk 修补过 ramdisk 的 AVD 上验证 `su -v`**：这类 AVD 的 `/system/xbin/su` 是 Magisk 残留存根（仅接受 `uid/gid` 参数），会遮蔽 `su` 查找；且 `adb shell` 的 uid 2000 默认不在 KernelSU 授权列表中。正确做法是：
-   - 用 `adb shell /data/adb/ksud debug version`（内核态验证），或在 Manager 界面为 App 授权；
-   - **推荐使用全新未打过 Magisk 的 AVD**，以获得干净的 `su` 路径。
+3. **`adb shell su -v` 不能用于验证 KernelSU**：`google_apis` 镜像自带 setuid root 的 AOSP 调试 su（`/system/xbin/su`，在只读系统分区上），它只接受 `su [uid] [gid] [命令]`，且不经 KernelSU 也能提权。正确的验证方式是 `ksud debug version` / `ksud debug info`，或观察内核日志中的 `KernelSU: ksu fd installed` 与 `allow root for: <uid>`。若要给 `adb shell` 提权，请在管理器界面将 Shell 加入授权名单。
 
 ---
 
