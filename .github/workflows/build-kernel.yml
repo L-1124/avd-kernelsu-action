@@ -198,12 +198,14 @@ jobs:
 
           BAZEL_FLAGS="${BAZEL_FLAGS} --config=stamp ${{ env.EXTRA_BAZEL_ARGS }}"
 
+          DIST_DIR="$PWD/out/dist"
+          mkdir -p "$DIST_DIR"
           echo "=========================================="
           echo "Running Bazel Build:"
-          echo "tools/bazel run ${BAZEL_FLAGS} ${{ env.BUILD_TARGET }} -- --dist_dir=out/dist --flat"
+          echo "tools/bazel run ${BAZEL_FLAGS} ${{ env.BUILD_TARGET }} -- --destdir $DIST_DIR"
           echo "=========================================="
 
-          tools/bazel run ${BAZEL_FLAGS} "${{ env.BUILD_TARGET }}" -- --dist_dir=out/dist --flat
+          tools/bazel run ${BAZEL_FLAGS} "${{ env.BUILD_TARGET }}" -- --destdir "$DIST_DIR"
 
       - name: Package Artifacts
         run: |
@@ -215,7 +217,7 @@ jobs:
           if [ -f "android-kernel/out/dist/bzImage" ]; then
             BZIMAGE_FOUND="android-kernel/out/dist/bzImage"
           else
-            BZIMAGE_FOUND=$(find android-kernel/out -name "bzImage" | head -n 1)
+            BZIMAGE_FOUND=$(find android-kernel -name "bzImage" 2>/dev/null | head -n 1)
           fi
 
           if [ -z "$BZIMAGE_FOUND" ] || [ ! -f "$BZIMAGE_FOUND" ]; then
@@ -227,19 +229,19 @@ jobs:
           cp "$BZIMAGE_FOUND" output/dist/bzImage
 
           # Copy vmlinux and System.map if available for debugging/tracing
-          find android-kernel/out/dist -name "vmlinux" -exec cp {} output/dist/ \; 2>/dev/null || true
-          find android-kernel/out/dist -name "System.map" -exec cp {} output/dist/ \; 2>/dev/null || true
+          find android-kernel -name "vmlinux" 2>/dev/null | head -n 1 | xargs -I {} cp {} output/dist/ 2>/dev/null || true
+          find android-kernel -name "System.map" 2>/dev/null | head -n 1 | xargs -I {} cp {} output/dist/ 2>/dev/null || true
 
           # Collect .ko kernel modules if present
           mkdir -p output/modules
           find android-kernel/out/dist -name "*.ko" -exec cp {} output/modules/ \; 2>/dev/null || true
+          find android-kernel/bazel-bin -name "*.ko" -exec cp {} output/modules/ \; 2>/dev/null || true
           if [ "$(ls -A output/modules 2>/dev/null)" ]; then
             tar -czvf output/dist/virtual_device_modules.tar.gz -C output/modules .
             rm -rf output/modules
           else
             rm -rf output/modules
           fi
-
           # Compute SHA-256
           cd output/dist
           sha256sum bzImage > bzImage.sha256sum
