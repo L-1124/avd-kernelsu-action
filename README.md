@@ -94,16 +94,43 @@ emulator @Pixel_10 -kernel F:\kernels\bzImage -show-kernel
 > *若您的 AVD 名称不同，请替换 `@Pixel_10` 为您的实际 AVD 名称（可通过 `emulator -list-avds` 查看）。*
 
 #### 方式 B：Android Studio 原生常驻持久化 (持久生效，推荐)
-只需修改 AVD 的配置文件，之后直接在 Android Studio Device Manager 中点击运行按钮即可自动加载 KernelSU 内核：
 
-1. 打开 AVD 的配置目录（通常位于 `C:\Users\<你的用户名>\.android\avd\<AVD名字>.avd\`）。
-2. 使用文本编辑器打开 `config.ini`。
-3. 在末尾追加或修改 `kernel.path` 项（**注意路径中的斜杠使用正斜杠 `/`**）：
-   ```ini
-   kernel.path = F:/kernels/bzImage
-   ```
-4. 保存 `config.ini`。
-5. 在 Android Studio 中直接启动该 AVD。
+> ⚠️ **不要改 `config.ini` 的 `kernel.path`——实测无效**。模拟器启动时会用系统镜像路径把它覆盖掉，生成的 `hardware-qemu.ini` 里实际变成：
+> ```ini
+> kernel.path = F:\android\system-images\android-36.1\google_apis\x86_64\\kernel-ranchu
+> ```
+> 同时该版本模拟器二进制中**不存在** `ANDROID_EMULATOR_KERNEL_FILE` 环境变量（实测查无此串），也无法通过环境变量指定内核。
+
+要让 Android Studio（它只执行 `emulator -avd <AVD>`，不带 `-kernel`，见其记录的 `emu-launch-params.txt`）也用上自定义内核，正确做法是**替换系统镜像的默认内核 `kernel-ranchu`**：
+
+```powershell
+$sys = "F:\android\system-images\android-36.1\google_apis\x86_64"
+
+# 1) 备份原装内核（只需一次）
+if (-not (Test-Path "$sys\kernel-ranchu.stock")) {
+    Copy-Item "$sys\kernel-ranchu" "$sys\kernel-ranchu.stock"
+}
+
+# 2) 用编译产物替换默认内核
+Copy-Item F:\kernels\bzImage "$sys\kernel-ranchu" -Force
+
+# 3) 丢弃旧快照（关键！否则快速启动会恢复旧内核的 RAM 镜像，KernelSU 依旧不生效）
+Rename-Item "$env:USERPROFILE\.android\avd\Pixel_10.avd\snapshots\default_boot" `
+            "default_boot.bak-stockkernel"
+```
+
+之后在 Android Studio Device Manager 中直接点运行即可，无需任何额外参数。
+
+**验证**（同样不带 `-kernel`，与 Studio 启动方式一致）：
+```powershell
+adb shell uname -r                                  # 应为你编译的内核
+adb root; adb shell /data/adb/ksud debug version    # 应为与内核一致的 KSU 版本号
+```
+> `ksud debug version` 返回 **0** 即表示当前仍是原装内核（内核里没有 KernelSU）。
+
+**回退**：`Copy-Item "$sys\kernel-ranchu.stock" "$sys\kernel-ranchu" -Force`，并把快照目录名改回 `default_boot`。
+
+> 注意：替换 `kernel-ranchu` 会影响**所有**使用该 system image 的 AVD（本例仅 Pixel_10）。若不同 AVD 需要不同内核，请改用方式 A 的 `-kernel` 参数，或为每个 AVD 复制一份独立 system image。
 
 ---
 
@@ -280,7 +307,7 @@ adb shell 'dmesg | tail -40 | grep -E "ksu fd installed|allow root for"'
 产物内容（Artifact 共 6 个文件）：
 
 ```text
-bzImage                        22 MB   ← 用于 -kernel / config.ini
+bzImage                        22 MB   ← 用于 -kernel，或替换 <sysdir>\kernel-ranchu（见第 4 节方式 B）
 bzImage.sha256sum              74 B    ← 校验值
 vmlinux                        204 MB  ← 带符号调试内核
 System.map                     9.4 MB  ← 符号表（含 281 个 KernelSU 符号）
@@ -288,11 +315,12 @@ virtual_device_modules.tar.gz  2.2 MB  ← 45 个虚拟设备驱动（goldfish_*
 bazel-build.log                ~100 KB ← 记录 KernelSU 驱动版本与管理器签名哈希
 ```
 
-#### ⚠️ 三个实测注意事项
+#### ⚠️ 四个实测注意事项
 
 1. **首次开机后必须重启一次**：KernelSU 会向 `init.rc` 注入 `exec u:r:ksu:s0 root -- /data/adb/ksud ...`，而 `/data/adb/ksud` 只有在安装 Manager App 之后才会生成。因此首次开机日志会出现 `Cannot find '/data/adb/ksud'`，属正常现象；安装 Manager 后重启一次，`ksud` 即可正常工作。
-2. **管理器版本务必与内核对齐**：实测官方 Release `33294` 管理器配 `33310` 内核可正常运行（本仓库的 HMA-OSS 安装器会给出"管理器与驱动版本不匹配"警告），但最终已改用同 commit 的 CI 产物 `..._33310-release.apk`；对齐后安装器侧的 `KSU_VER_CODE == KSU_KERNEL_VER_CODE` 才成立。完整流程与签名校验见 [第 7 节](#7-管理器-apk-与内核版本对齐manager-apk-matching)。
-3. **`adb shell su -v` 不能用于验证 KernelSU**：`google_apis` 镜像自带 setuid root 的 AOSP 调试 su（`/system/xbin/su`，在只读系统分区上），它只接受 `su [uid] [gid] [命令]`，且不经 KernelSU 也能提权。正确的验证方式是 `ksud debug version` / `ksud debug info`，或观察内核日志中的 `KernelSU: ksu fd installed` 与 `allow root for: <uid>`。若要给 `adb shell` 提权，请在管理器界面将 Shell 加入授权名单。
+2. **Android Studio 启动不会带上自定义内核**：Studio 执行的是 `emulator -avd <AVD>`（实测其 `emu-launch-params.txt` 中无 `-kernel`），且 `config.ini` 的 `kernel.path` 会被模拟器覆盖为 `<sysdir>\\kernel-ranchu`（实测启动后 `ksud debug version` 返回 **0**，即原装内核）。必须在 Studio 中使用 KernelSU，请按 [第 4 节方式 B](#方式-bandroid-studio-原生常驻持久化-持久生效推荐) 替换 `<sysdir>\kernel-ranchu`（并丢弃旧快照），替换后不带任何参数启动即得 `Kernel Version: 33310`。
+3. **管理器版本务必与内核对齐**：实测官方 Release `33294` 管理器配 `33310` 内核可正常运行（本仓库的 HMA-OSS 安装器会给出"管理器与驱动版本不匹配"警告），但最终已改用同 commit 的 CI 产物 `..._33310-release.apk`；对齐后安装器侧的 `KSU_VER_CODE == KSU_KERNEL_VER_CODE` 才成立。完整流程与签名校验见 [第 7 节](#7-管理器-apk-与内核版本对齐manager-apk-matching)。
+4. **`adb shell su -v` 不能用于验证 KernelSU**：`google_apis` 镜像自带 setuid root 的 AOSP 调试 su（`/system/xbin/su`，在只读系统分区上），它只接受 `su [uid] [gid] [命令]`，且不经 KernelSU 也能提权。正确的验证方式是 `ksud debug version` / `ksud debug info`，或观察内核日志中的 `KernelSU: ksu fd installed` 与 `allow root for: <uid>`。若要给 `adb shell` 提权，请在管理器界面将 Shell 加入授权名单。
 
 ---
 
@@ -313,7 +341,7 @@ bazel-build.log                ~100 KB ← 记录 KernelSU 驱动版本与管理
 This repository provides an automated GitHub Actions CI workflow to compile an **x86_64 Android Emulator (AVD) Kernel with integrated KernelSU / KernelSU-Next** (`bzImage`) on free GitHub-hosted runners using Google's Kleaf (Bazel) build toolchain.
 
 ### Key Highlights
-- **Direct Kernel Boot**: Boots directly via emulator `-kernel bzImage` or `config.ini` parameter (`kernel.path`).
+- **Direct Kernel Boot**: Boots directly via emulator `-kernel bzImage`, or by replacing the system image's default kernel `<sysdir>\kernel-ranchu` (required for Android Studio launches — see below).
 - **Zero Tampering**: No need for `-writable-system`, no ramdisk patching, and zero modification of system partitions.
 - **Full Driver Compatibility**: Compiled against target virtual device definitions (`//common-modules/virtual-device:virtual_device_x86_64_dist`), ensuring complete binary KMI compatibility with stock AVD `.ko` vendor drivers.
 - **Optimized for CI**: Pre-configured with disk space maximization (55GB+ free space), 8GB swap memory, and fast Bazel build flags (`--lto=none --config=fast`) to prevent runner OOM errors.
@@ -327,10 +355,15 @@ This repository provides an automated GitHub Actions CI workflow to compile an *
    ```powershell
    emulator @<AVD_NAME> -kernel path\to\bzImage -show-kernel
    ```
-   Or persist in `~/.android/avd/<AVD_NAME>.avd/config.ini`:
-   ```ini
-   kernel.path = path/to/bzImage
+   For **Android Studio** (which runs `emulator -avd <AVD>` with no `-kernel`), replace the system
+   image's default kernel instead — `config.ini`'s `kernel.path` is overwritten by the emulator:
+   ```powershell
+   $sys = "F:\android\system-images\android-36.1\google_apis\x86_64"
+   Copy-Item "$sys\kernel-ranchu" "$sys\kernel-ranchu.stock"   # backup once
+   Copy-Item path\to\bzImage "$sys\kernel-ranchu" -Force
+   Rename-Item "$env:USERPROFILE\.android\avd\<AVD_NAME>.avd\snapshots\default_boot" "default_boot.bak-stockkernel"
    ```
+   Verify with `adb shell uname -r` and `adb shell /data/adb/ksud debug version` (`0` means the stock kernel is still in use).
 6. Install the matching KernelSU Manager APK, then verify in-kernel status:
    ```powershell
    adb shell /data/adb/ksud debug version   # -> "Kernel Version: 33310"
