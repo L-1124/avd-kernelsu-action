@@ -245,16 +245,16 @@ jobs:
           # Compute SHA-256
           cd output/dist
           sha256sum bzImage > bzImage.sha256sum
+          BZ_SHA256=$(awk '{print $1}' bzImage.sha256sum)
+          BZ_SIZE=$(du -h bzImage | awk '{print $1}')
+          echo "BZ_SHA256=$BZ_SHA256" >> $GITHUB_ENV
+          echo "BZ_SIZE=$BZ_SIZE" >> $GITHUB_ENV
           echo "=== Artifacts Summary ==="
           ls -lh
-          echo "SHA256 of bzImage:"
-          cat bzImage.sha256sum
+          echo "SHA256 of bzImage: $BZ_SHA256"
 
       - name: Generate Build Summary
         run: |
-          cd output/dist
-          BZ_SHA=$(awk '{print $1}' bzImage.sha256sum)
-          BZ_SIZE=$(ls -lh bzImage | awk '{print $5}')
           cat << EOF >> $GITHUB_STEP_SUMMARY
           ## 🎉 AVD KernelSU Build Succeeded!
 
@@ -264,8 +264,8 @@ jobs:
           | **KernelSU Flavor** | \`${{ env.KSU_FLAVOR }}\` (\`${{ env.KSU_VERSION }}\`) |
           | **Target** | \`${{ env.BUILD_TARGET }}\` |
           | **LTO Mode** | \`${{ env.LTO_MODE }}\` |
-          | **bzImage Size** | \`${BZ_SIZE}\` |
-          | **bzImage SHA256** | \`${BZ_SHA}\` |
+          | **bzImage Size** | \`${{ env.BZ_SIZE }}\` |
+          | **bzImage SHA256** | \`${{ env.BZ_SHA256 }}\` |
 
           ### 🚀 How to Launch AVD with this Kernel
 
@@ -297,7 +297,7 @@ jobs:
         if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.create_release == true
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || format('v6.12-ksu-{0}', github.run_id) }}
+          tag_name: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v6.12-ksu-{0}', github.run_number) }}
           name: AVD KernelSU ${{ env.KSU_FLAVOR }} (${{ env.KERNEL_MANIFEST_BRANCH }})
           body: |
             ## AVD KernelSU Custom Kernel Release
@@ -305,7 +305,12 @@ jobs:
             - **KernelSU Flavor**: `${{ env.KSU_FLAVOR }}` (`${{ env.KSU_VERSION }}`)
             - **Build Target**: `${{ env.BUILD_TARGET }}`
             - **LTO**: `${{ env.LTO_MODE }}`
-            - **SHA256**: `$(awk '{print $1}' output/dist/bzImage.sha256sum)`
+            - **bzImage Size**: `${{ env.BZ_SIZE }}`
+            - **bzImage SHA256**: `${{ env.BZ_SHA256 }}`
+
+            ```powershell
+            emulator @<AVD_NAME> -kernel path\to\bzImage -show-kernel
+            ```
           files: |
             output/dist/bzImage
             output/dist/bzImage.sha256sum
