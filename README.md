@@ -115,24 +115,34 @@ AVD 启动进入桌面后，打开命令行执行以下验证步骤：
 ```powershell
 adb shell uname -a
 ```
-预期输出包含您编译内核的构建时间和版本号（如 `6.12.xx-android16-...`）。
+预期输出包含您编译内核的构建时间和版本号（如 `6.12.xx-android16-...`），且与产物 `bzImage` 同源（可用 `vmlinux` 中的 `Linux version` 字符串交叉核对）。
 
-#### 2. 验证 Root 提权
-```powershell
-adb shell su -v
-```
-输出 KernelSU 的版本代号或版本号即代表提权通道正常。
-
-#### 3. 安装管理器 App
+#### 2. 安装管理器 App
 下载并安装对应变种的管理器 APK：
 - **KernelSU-Next 管理器**：前往 [KernelSU-Next Releases](https://github.com/KernelSU-Next/KernelSU-Next/releases) 下载最新 APK。
 - **KernelSU 官方管理器**：前往 [KernelSU Releases](https://github.com/tiann/KernelSU/releases) 下载最新 APK。
 
 安装到 AVD：
 ```powershell
-adb install KernelSU_Next_v1.0.5.apk
+adb install KernelSU_Next_v3.4.0_33294-release.apk
 ```
-在模拟器内打开管理器，主页将显示 **“工作中”**，即可在授权界面中为目标 App 分配 Root 权限及模块管理能力。
+在模拟器内打开管理器，主页显示 **“工作中 (Working)”** 即表示内核态 KernelSU 已正常工作，可在授权界面中为目标 App 分配 Root 权限及模块管理能力。
+
+> ⚠️ 安装管理器后请**重启一次 AVD**：`/data/adb/ksud` 由管理器生成，而 KernelSU 注入的 `init.rc` 启动项在首次开机时该文件尚不存在。
+
+#### 3. 验证内核态 KernelSU（推荐，最可靠的验证方式）
+```powershell
+adb shell /data/adb/ksud debug version
+# 预期输出：Kernel Version: 33310
+
+adb shell /data/adb/ksud debug info
+# 预期输出：runtime_mode: built-in / lkm: false / uapi_version: 4
+```
+可通过 `adb shell 'cat /proc/kallsyms | grep -E " (kernelsu_init|ksu_cred)$"'` 进一步确认 KernelSU 符号已内置到运行中的内核。
+
+#### 4. 关于 `adb shell su -v`
+- `su` 依赖 **KernelSU 授权名单**：`adb shell` 的 uid 2000 默认不在名单内，需先在管理器界面把 `Shell` 加入允许列表。
+- 若 AVD 的 ramdisk 曾被 **Magisk** 修补过，`/system/xbin/su` 会残留非 KernelSU 的 su，从而遮蔽 `su` 查找（表现为 `su: invalid uid/gid '-v'`）。**建议使用全新未打 Magisk 的 AVD** 来获得干净的 `su` 路径。
 
 ---
 
@@ -159,7 +169,42 @@ adb install KernelSU_Next_v1.0.5.apk
 
 ---
 
-### 7. 常见问题 (FAQ)
+### 8. 已实机验证记录 (Verified on AVD)
+
+以下结论来自一次真实构建与真机启动验证（Actions Run `35982444708`，构建耗时 31m46s，产物 `bzImage` 22 MB）：
+
+| 验证项 | 结果 |
+| :--- | :--- |
+| **启动方式** | `emulator @Pixel_10 -kernel bzImage -no-window` |
+| **`uname -r`** | `6.12.38-android16-5-gdfed788d0bca-dirty`（与 vmlinux 内 `Linux version` 完全一致） |
+| **`/proc/kallsyms`** | 存在 `kernelsu_init` (T)、`ksu_cred` (B)、`ksu_syscall_dispatcher` (t) → KernelSU 已内置 |
+| **`ksud debug version`** | `Kernel Version: 33310`（KernelSU-Next v3.4.0） |
+| **`ksud debug info`** | `runtime_mode: built-in`、`lkm: false`、`uapi_version: 4` |
+| **Manager 握手** | 内核日志出现 `KernelSU: allow root for: 10226`（成功为管理器进程授权） |
+| **驱动兼容性** | 内核日志中 `unknown symbol` / `disagrees about version` / `module verification failed` 计数均为 **0**；AVD 原装 `.ko`（`vivid`、`virtio_*`、`v4l2loopback`、`system_heap` 等）全部正常加载 |
+| **SELinux** | `Enforcing`，系统正常启动至桌面 |
+
+产物内容（Artifact 共 5 个文件）：
+
+```text
+bzImage                        22 MB   ← 用于 -kernel / config.ini
+bzImage.sha256sum              74 B    ← 校验值
+vmlinux                        204 MB  ← 带符号调试内核
+System.map                     9.4 MB  ← 符号表（含 281 个 KernelSU 符号）
+virtual_device_modules.tar.gz  2.2 MB  ← 45 个虚拟设备驱动（goldfish_*/virtio-*/vkms 等）
+```
+
+#### ⚠️ 三个实测注意事项
+
+1. **首次开机后必须重启一次**：KernelSU 会向 `init.rc` 注入 `exec u:r:ksu:s0 root -- /data/adb/ksud ...`，而 `/data/adb/ksud` 只有在安装 Manager App 之后才会生成。因此首次开机日志会出现 `Cannot find '/data/adb/ksud'`，属正常现象；安装 Manager 后重启一次，`ksud` 即可正常工作。
+2. **Manager APK 版本可略旧于内核**：实测内核 `33310`（v3.4.0）与官方 Manager APK `33294` 握手成功（签名一致即可）。但建议尽量使用与内核同一版本系列的官方 APK。
+3. **不要在曾被 Magisk 修补过 ramdisk 的 AVD 上验证 `su -v`**：这类 AVD 的 `/system/xbin/su` 是 Magisk 残留存根（仅接受 `uid/gid` 参数），会遮蔽 `su` 查找；且 `adb shell` 的 uid 2000 默认不在 KernelSU 授权列表中。正确做法是：
+   - 用 `adb shell /data/adb/ksud debug version`（内核态验证），或在 Manager 界面为 App 授权；
+   - **推荐使用全新未打过 Magisk 的 AVD**，以获得干净的 `su` 路径。
+
+---
+
+### 9. 常见问题 (FAQ)
 
 - **Q: 为什么不编译 `//common:kernel_x86_64_dist` 而是 `//common-modules/virtual-device:virtual_device_x86_64_dist`？**
   - **A**: `//common:kernel_x86_64_dist` 仅包含纯净 Generic Kernel Image，缺少虚拟化设备所需的关键外设驱动和 goldfish/virtio 模块配置。只有编译 `virtual_device_x86_64_dist`，产出的 `bzImage` 才能完整驱动 AVD 的虚拟硬件。
@@ -194,7 +239,12 @@ This repository provides an automated GitHub Actions CI workflow to compile an *
    ```ini
    kernel.path = path/to/bzImage
    ```
-6. Install KernelSU Manager APK and verify via `adb shell su -v`.
+6. Install the matching KernelSU Manager APK, then verify in-kernel status:
+   ```powershell
+   adb shell /data/adb/ksud debug version   # -> "Kernel Version: 33310"
+   adb shell /data/adb/ksud debug info      # -> runtime_mode: built-in
+   ```
+   Grant root per-app from the Manager UI. Note: `/data/adb/ksud` only exists after the Manager is installed — reboot once after installing it.
 
 ---
 
