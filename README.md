@@ -118,17 +118,16 @@ adb shell uname -a
 预期输出包含您编译内核的构建时间和版本号（如 `6.12.xx-android16-...`），且与产物 `bzImage` 同源（可用 `vmlinux` 中的 `Linux version` 字符串交叉核对）。
 
 #### 2. 安装管理器 App
-下载并安装对应变种的管理器 APK：
-- **KernelSU-Next 管理器**：前往 [KernelSU-Next Releases](https://github.com/KernelSU-Next/KernelSU-Next/releases) 下载最新 APK。
-- **KernelSU 官方管理器**：前往 [KernelSU Releases](https://github.com/tiann/KernelSU/releases) 下载最新 APK。
+**按内核版本对齐安装**（详见 [第 7 节](#7-管理器-apk-与内核版本对齐manager-apk-matching)）——官方 Release 通常落后于内核所在的 `dev`，建议取同 commit 的 CI 产物：
 
-安装到 AVD：
 ```powershell
-adb install KernelSU_Next_v3.4.0_33294-release.apk
+adb install -r KernelSU_Next_v3.4.0-16-g32e897e2_33310-release.apk   # versionCode 需与内核驱动版本一致
 ```
 在模拟器内打开管理器，主页显示 **“工作中 (Working)”** 即表示内核态 KernelSU 已正常工作，可在授权界面中为目标 App 分配 Root 权限及模块管理能力。
 
-> ⚠️ 安装管理器后请**重启一次 AVD**：`/data/adb/ksud` 由管理器生成，而 KernelSU 注入的 `init.rc` 启动项在首次开机时该文件尚不存在。
+> ⚠️ 两点务必注意：
+> 1. 安装管理器后请**重启一次 AVD**：`/data/adb/ksud` 由管理器生成，而 KernelSU 注入的 `init.rc` 启动项在首次开机时该文件尚不存在。
+> 2. 安装前先校验 APK 签名（`apksigner verify --print-certs`）是否等于内核的 `Manager signature hash`，否则管理器拿不到 root。
 
 #### 3. 验证内核态 KernelSU（推荐，最可靠的验证方式）
 ```powershell
@@ -178,6 +177,91 @@ adb shell dmesg | findstr /C:"/data/adb/ksud"
 
 ---
 
+### 7. 管理器 APK 与内核版本对齐（Manager APK matching）
+
+KernelSU 的**内核驱动**内置了"可信任管理器"的签名哈希，管理器 APK 的版本与签名必须与内核匹配，否则管理器界面拿不到 root（表现：无 supercall fd、无法授权、模块页面异常）。
+
+#### 7.1 版本号是怎么来的
+
+KernelSU-Next 的 `kernel/Kbuild` 明确定义：
+
+```make
+KSU_GIT_VERSION := $(shell cd $(GIT_ROOT) && git rev-list --count HEAD)
+KSU_VERSION = $(shell expr 30000 + $(KSU_GIT_VERSION))
+```
+
+即 **versionCode = 30000 + 内核所集成的 KernelSU 仓库提交数**。所以 `33310` 表示该 checkout 有 3310 个提交，而官方 Release `v3.4.0`（APK versionCode `33294`）= 3294 个提交 —— 两者差 16 个提交。
+
+#### 7.2 两个必须对齐的值
+
+构建完成后，从 **Job Summary** 或产物中的 `bazel-build.log` 读取：
+
+| 值 | 含义 | 实测示例（本次内核） |
+| :--- | :--- | :--- |
+| `KernelSU driver version` | 内核驱动版本号（= `30000 + 提交数`） | `33310` |
+| `Manager signature hash` | 内核要求的管理器签名证书 SHA-256 | `79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7` |
+| `KernelSU ref` | 本次集成所用的 ref（`dev` / tag / commit） | `dev` @ `32e897e2` |
+
+驱动版本也可在设备上直接查询：
+
+```powershell
+adb root
+adb shell /data/adb/ksud debug version     # Kernel Version: 33310
+```
+
+#### 7.3 去哪里找那个版本的管理器 APK
+
+**官方 Release 往往落后于 `dev`**（本例 Release 只有 33294）。要拿到与内核严格同版本的管理器，用上游 CI 产物 —— workflow `Build Manager CI` 在 `dev` 每次提交都会产出 `manager` artifact：
+
+```powershell
+# 1) 找到与内核同一 commit 的那次 CI（本例 commit 32e897e2）
+gh run list --repo KernelSU-Next/KernelSU-Next --workflow "Build Manager CI" --branch dev --limit 5
+
+# 2) 下载 manager 产物
+gh run download <RUN_ID> --repo KernelSU-Next/KernelSU-Next --name manager
+
+# 产物命名规律：KernelSU_Next_<tag>-<n>-g<shortsha>_<versionCode>-release.apk
+# 例：KernelSU_Next_v3.4.0-16-g32e897e2_33310-release.apk
+```
+
+#### 7.4 安装前必须校验签名（关键步骤）
+
+CI 产物与官方 Release 使用**同一签名密钥**，但自己编译的 APK 不是，装了会被内核静默拒绝。校验方法：
+
+```powershell
+# 需要 Android SDK build-tools 里的 apksigner
+apksigner verify --print-certs KernelSU_Next_v3.4.0-16-g32e897e2_33310-release.apk
+# 关注输出中的：
+#   Signer #1 certificate SHA-256 digest: 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7
+#                                            ↑ 必须等于内核的 Manager signature hash
+```
+
+签名一致后再安装并验证内核确已接受：
+
+```powershell
+adb install -r KernelSU_Next_v3.4.0-16-g32e897e2_33310-release.apk
+adb shell 'dumpsys package com.rifsxd.ksunext | grep versionCode'   # 期望 33310
+adb shell 'dmesg | tail -40 | grep -E "ksu fd installed|allow root for"'
+#   期望： KernelSU: ksu fd installed: 5 for pid xxxx
+#          KernelSU: allow root for: <uid>          ← 管理器进程的 uid
+```
+
+也可用最小模块从安装器视角验证两个版本号是否一致（会打印 `KSU_VER_CODE` / `KSU_KERNEL_VER_CODE`）：
+
+```powershell
+# 装一个只做 ui_print 的探针模块，安装日志应为 MATCH
+#   - KSU_VER_CODE=33310        (manager)
+#   - KSU_KERNEL_VER_CODE=33310 (kernel)
+```
+
+#### 7.5 常见误区
+
+- **不要用 `next` 作为 ref**：KernelSU-Next 的 `next` 分支已不存在（现为 `dev`，另有 `legacy`）。`git checkout next` 会失败并被 setup.sh 静默回退到默认分支，导致编译出的其实不是你以为的版本。本工作流已默认 `dev`，且当 ref 不存在时**直接报错退出**（不再静默回退）。
+- **签名不符 ≠ 版本不符**：版本不符通常只是警告（管理器与新驱动一般仍可用）；签名不符则管理器完全拿不到 root。
+- **管理器版本可以略旧**：实测 33294 管理器配 33310 内核仍能正常工作（`allow root for` 成功）；对齐只是为了消除隐患与警告。
+
+---
+
 ### 8. 已实机验证记录 (Verified on AVD)
 
 以下结论来自一次真实构建与真机启动验证（Actions Run `35982444708`，构建耗时 31m46s，产物 `bzImage` 22 MB）：
@@ -193,7 +277,7 @@ adb shell dmesg | findstr /C:"/data/adb/ksud"
 | **驱动兼容性** | 内核日志中 `unknown symbol` / `disagrees about version` / `module verification failed` 计数均为 **0**；AVD 原装 `.ko`（`vivid`、`virtio_*`、`v4l2loopback`、`system_heap` 等）全部正常加载 |
 | **SELinux** | `Enforcing`，系统正常启动至桌面 |
 
-产物内容（Artifact 共 5 个文件）：
+产物内容（Artifact 共 6 个文件）：
 
 ```text
 bzImage                        22 MB   ← 用于 -kernel / config.ini
@@ -201,12 +285,13 @@ bzImage.sha256sum              74 B    ← 校验值
 vmlinux                        204 MB  ← 带符号调试内核
 System.map                     9.4 MB  ← 符号表（含 281 个 KernelSU 符号）
 virtual_device_modules.tar.gz  2.2 MB  ← 45 个虚拟设备驱动（goldfish_*/virtio-*/vkms 等）
+bazel-build.log                ~100 KB ← 记录 KernelSU 驱动版本与管理器签名哈希
 ```
 
 #### ⚠️ 三个实测注意事项
 
 1. **首次开机后必须重启一次**：KernelSU 会向 `init.rc` 注入 `exec u:r:ksu:s0 root -- /data/adb/ksud ...`，而 `/data/adb/ksud` 只有在安装 Manager App 之后才会生成。因此首次开机日志会出现 `Cannot find '/data/adb/ksud'`，属正常现象；安装 Manager 后重启一次，`ksud` 即可正常工作。
-2. **Manager APK 版本可略旧于内核**：实测内核 `33310`（v3.4.0）与官方 Manager APK `33294` 握手成功（签名一致即可）。但建议尽量使用与内核同一版本系列的官方 APK。
+2. **管理器版本务必与内核对齐**：实测官方 Release `33294` 管理器配 `33310` 内核可正常运行（本仓库的 HMA-OSS 安装器会给出"管理器与驱动版本不匹配"警告），但最终已改用同 commit 的 CI 产物 `..._33310-release.apk`；对齐后安装器侧的 `KSU_VER_CODE == KSU_KERNEL_VER_CODE` 才成立。完整流程与签名校验见 [第 7 节](#7-管理器-apk-与内核版本对齐manager-apk-matching)。
 3. **`adb shell su -v` 不能用于验证 KernelSU**：`google_apis` 镜像自带 setuid root 的 AOSP 调试 su（`/system/xbin/su`，在只读系统分区上），它只接受 `su [uid] [gid] [命令]`，且不经 KernelSU 也能提权。正确的验证方式是 `ksud debug version` / `ksud debug info`，或观察内核日志中的 `KernelSU: ksu fd installed` 与 `allow root for: <uid>`。若要给 `adb shell` 提权，请在管理器界面将 Shell 加入授权名单。
 
 ---
@@ -252,6 +337,14 @@ This repository provides an automated GitHub Actions CI workflow to compile an *
    adb shell /data/adb/ksud debug info      # -> runtime_mode: built-in
    ```
    Grant root per-app from the Manager UI. Note: `/data/adb/ksud` only exists after the Manager is installed — reboot once after installing it.
+
+   > **Manager APK matching**: the kernel embeds the trusted manager signature hash, and the
+   > KernelSU versionCode equals `30000 + <commit count>` of the KernelSU checkout. The official
+   > release usually lags behind `dev`, so fetch the `manager` artifact from upstream's
+   > `Build Manager CI` run at the *same commit*, then verify with
+   > `apksigner verify --print-certs` that its certificate SHA-256 equals the
+   > **Manager signature hash** reported in this workflow's job summary.
+   > Full procedure: [section 7](#7-管理器-apk-与内核版本对齐manager-apk-matching).
 
 ---
 

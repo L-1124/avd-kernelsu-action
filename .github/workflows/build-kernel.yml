@@ -17,9 +17,9 @@ name: Build AVD KernelSU
           - 'KernelSU-Next'
           - 'KernelSU'
       ksu_version:
-        description: 'KernelSU Branch / Tag (e.g. next, main, v1.0.5)'
+        description: 'KernelSU branch / tag / commit SHA (KernelSU-Next: dev; KernelSU: main)'
         required: true
-        default: 'next'
+        default: 'dev'
         type: string
       build_target:
         description: 'Kleaf Build Target'
@@ -121,28 +121,43 @@ jobs:
       - name: Integrate KernelSU & Configure Kernel
         working-directory: android-kernel
         run: |
-          set -e
+          set -eo pipefail
           echo "=== Integrating KernelSU ==="
           if [ "${{ env.KSU_FLAVOR }}" = "KernelSU-Next" ]; then
-            SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
-            DEFAULT_VER="next"
+            REPO_SLUG="KernelSU-Next/KernelSU-Next"
+            DEFAULT_REF="dev"
           else
-            SETUP_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
-            DEFAULT_VER="main"
+            REPO_SLUG="tiann/KernelSU"
+            DEFAULT_REF="main"
           fi
+          REPO_URL="https://github.com/$REPO_SLUG"
 
           KSU_TARGET_VER="${{ env.KSU_VERSION }}"
-          if [ -z "$KSU_TARGET_VER" ]; then
-            KSU_TARGET_VER="$DEFAULT_VER"
-          fi
+          [ -n "$KSU_TARGET_VER" ] || KSU_TARGET_VER="$DEFAULT_REF"
+
+          # Fail loudly on a nonexistent ref instead of silently falling back to the
+          # default branch (which would build an unexpected KernelSU commit).
+          # Pure 40-char hex values are treated as commit SHAs and skipped here.
+          case "$KSU_TARGET_VER" in
+            (*[!0-9a-f]*)
+              if ! git ls-remote --exit-code "$REPO_URL" "$KSU_TARGET_VER" >/dev/null 2>&1; then
+                echo "::error::'$KSU_TARGET_VER' is not a branch or tag in $REPO_URL. Use a real ref (e.g. '$DEFAULT_REF') or a 40-char commit SHA."
+                exit 1
+              fi
+              ;;
+            (*) echo "Interpreting '$KSU_TARGET_VER' as a commit SHA (skipping ref lookup)" ;;
+          esac
+
+          SETUP_URL="https://raw.githubusercontent.com/$REPO_SLUG/$KSU_TARGET_VER/kernel/setup.sh"
 
           echo "Flavor: ${{ env.KSU_FLAVOR }}"
-          echo "Version: $KSU_TARGET_VER"
+          echo "Repo: $REPO_URL"
+          echo "Ref: $KSU_TARGET_VER"
           echo "Setup URL: $SETUP_URL"
 
-          # Execute setup.sh inside common/
+          # Execute setup.sh inside common/ (-f so a 404 is an error, not an HTML pipe into bash)
           cd common
-          curl -LSs "$SETUP_URL" | bash -s "$KSU_TARGET_VER"
+          curl -LSsf "$SETUP_URL" | bash -s "$KSU_TARGET_VER"
 
           # Inject CONFIG_KSU into defconfigs
           echo "=== Injecting CONFIG_KSU and x86_64 dispatcher patch into defconfigs ==="
@@ -186,7 +201,7 @@ jobs:
       - name: Build Kernel with Kleaf
         working-directory: android-kernel
         run: |
-          set -e
+          set -eo pipefail
           BAZEL_FLAGS=""
           if [ "${{ env.USE_FAST_CONFIG }}" = "true" ]; then
             BAZEL_FLAGS="--config=fast"
@@ -199,13 +214,23 @@ jobs:
           BAZEL_FLAGS="${BAZEL_FLAGS} --config=stamp ${{ env.EXTRA_BAZEL_ARGS }}"
 
           DIST_DIR="$PWD/out/dist"
-          mkdir -p "$DIST_DIR"
+          BUILD_LOG="$PWD/out/bazel-build.log"
+          mkdir -p "$DIST_DIR" "$PWD/out"
           echo "=========================================="
           echo "Running Bazel Build:"
           echo "tools/bazel run ${BAZEL_FLAGS} ${{ env.BUILD_TARGET }} -- --destdir $DIST_DIR"
           echo "=========================================="
 
-          tools/bazel run ${BAZEL_FLAGS} "${{ env.BUILD_TARGET }}" -- --destdir "$DIST_DIR"
+          tools/bazel run ${BAZEL_FLAGS} "${{ env.BUILD_TARGET }}" -- --destdir "$DIST_DIR" 2>&1 | tee "$BUILD_LOG"
+
+          # Report the KernelSU driver version and the manager APK signature the kernel
+          # expects, so the matching manager APK can be selected and verified.
+          KSU_DRIVER_VER=$(grep -m1 -oE 'KernelSU(-Next)? version: [0-9]+' "$BUILD_LOG" | awk '{print $NF}' || true)
+          KSU_MGR_SIG=$(grep -m1 -oE 'Manager signature hash: [0-9a-f]{64}' "$BUILD_LOG" | awk '{print $NF}' || true)
+          echo "KernelSU driver version : ${KSU_DRIVER_VER:-unknown}"
+          echo "Manager signature hash  : ${KSU_MGR_SIG:-unknown}"
+          echo "KSU_DRIVER_VER=${KSU_DRIVER_VER}" >> $GITHUB_ENV
+          echo "KSU_MGR_SIG=${KSU_MGR_SIG}" >> $GITHUB_ENV
 
       - name: Package Artifacts
         run: |
@@ -242,6 +267,10 @@ jobs:
           else
             rm -rf output/modules
           fi
+          # Keep the build log: it records the KernelSU driver version and the manager
+          # signature hash the kernel expects.
+          cp android-kernel/out/bazel-build.log output/dist/bazel-build.log 2>/dev/null || true
+
           # Compute SHA-256
           cd output/dist
           sha256sum bzImage > bzImage.sha256sum
@@ -262,10 +291,14 @@ jobs:
           | :--- | :--- |
           | **Manifest Branch** | \`${{ env.KERNEL_MANIFEST_BRANCH }}\` |
           | **KernelSU Flavor** | \`${{ env.KSU_FLAVOR }}\` (\`${{ env.KSU_VERSION }}\`) |
+          | **KernelSU driver version** | \`${{ env.KSU_DRIVER_VER }}\` |
+          | **Manager signature hash** | \`${{ env.KSU_MGR_SIG }}\` |
           | **Target** | \`${{ env.BUILD_TARGET }}\` |
           | **LTO Mode** | \`${{ env.LTO_MODE }}\` |
           | **bzImage Size** | \`${{ env.BZ_SIZE }}\` |
           | **bzImage SHA256** | \`${{ env.BZ_SHA256 }}\` |
+
+          > 安装管理器 APK 时请选择 versionCode 与上方 **KernelSU driver version** 一致、且签名证书 SHA-256 等于 **Manager signature hash** 的版本，详见 README 第 7 节。
 
           ### 🚀 How to Launch AVD with this Kernel
 
@@ -291,6 +324,7 @@ jobs:
             output/dist/virtual_device_modules.tar.gz
             output/dist/vmlinux
             output/dist/System.map
+            output/dist/bazel-build.log
           retention-days: 90
 
       - name: Create Release
@@ -303,10 +337,15 @@ jobs:
             ## AVD KernelSU Custom Kernel Release
             - **AOSP Kernel Branch**: `${{ env.KERNEL_MANIFEST_BRANCH }}`
             - **KernelSU Flavor**: `${{ env.KSU_FLAVOR }}` (`${{ env.KSU_VERSION }}`)
+            - **KernelSU driver version**: `${{ env.KSU_DRIVER_VER }}`
+            - **Manager signature hash**: `${{ env.KSU_MGR_SIG }}`
             - **Build Target**: `${{ env.BUILD_TARGET }}`
             - **LTO**: `${{ env.LTO_MODE }}`
             - **bzImage Size**: `${{ env.BZ_SIZE }}`
             - **bzImage SHA256**: `${{ env.BZ_SHA256 }}`
+
+            > Use a manager APK whose versionCode equals the KernelSU driver version above and
+            > whose signing certificate SHA-256 equals the manager signature hash above.
 
             ```powershell
             emulator @<AVD_NAME> -kernel path\to\bzImage -show-kernel
