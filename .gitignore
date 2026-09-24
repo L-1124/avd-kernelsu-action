@@ -1,0 +1,25 @@
+# OS and Editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Kernel build artifacts and outputs
+out/
+dist/
+build/
+*.bzImage
+bzImage
+*.ko
+*.img
+*.tar.gz
+*.zip
+*.sha256sum
+
+# Repo tool artifacts
+.repo/

@@ -1,0 +1,300 @@
+name: Build AVD KernelSU
+
+'on':
+  workflow_dispatch:
+    inputs:
+      kernel_manifest_branch:
+        description: 'AOSP Kernel Manifest Branch'
+        required: true
+        default: 'common-android16-6.12-2025-09'
+        type: string
+      ksu_flavor:
+        description: 'KernelSU Variant (KernelSU-Next or KernelSU)'
+        required: true
+        default: 'KernelSU-Next'
+        type: choice
+        options:
+          - 'KernelSU-Next'
+          - 'KernelSU'
+      ksu_version:
+        description: 'KernelSU Branch / Tag (e.g. next, main, v1.0.5)'
+        required: true
+        default: 'next'
+        type: string
+      build_target:
+        description: 'Kleaf Build Target'
+        required: true
+        default: '//common-modules/virtual-device:virtual_device_x86_64_dist'
+        type: string
+      lto_mode:
+        description: 'Link Time Optimization (LTO)'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - 'none'
+          - 'thin'
+          - 'default'
+      use_fast_config:
+        description: 'Enable Kleaf --config=fast'
+        required: false
+        default: true
+        type: boolean
+      extra_bazel_args:
+        description: 'Additional Bazel Arguments'
+        required: false
+        default: '--jobs=4'
+        type: string
+      create_release:
+        description: 'Publish as GitHub Release'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build AVD Kernel
+    runs-on: ubuntu-24.04
+    env:
+      KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_manifest_branch || 'common-android16-6.12-2025-09' }}
+      KSU_FLAVOR: ${{ inputs.ksu_flavor || 'KernelSU-Next' }}
+      KSU_VERSION: ${{ inputs.ksu_version || 'next' }}
+      BUILD_TARGET: ${{ inputs.build_target || '//common-modules/virtual-device:virtual_device_x86_64_dist' }}
+      LTO_MODE: ${{ inputs.lto_mode || 'none' }}
+      USE_FAST_CONFIG: ${{ inputs.use_fast_config != false }}
+      EXTRA_BAZEL_ARGS: ${{ inputs.extra_bazel_args || '--jobs=4' }}
+
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          overprovision-lvm: 'true'
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Check Environment Resources
+        run: |
+          echo "=== Disk Space ==="
+          df -h
+          echo "=== Memory & Swap ==="
+          free -h
+          echo "=== CPU Info ==="
+          nproc
+          lscpu | grep "Model name\|CPU(s):" || true
+
+      - name: Install Dependencies & Setup Repo Tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl git python3 python3-pip bison flex libssl-dev libelf-dev bc rsync zip unzip tar
+          mkdir -p ~/.bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Sync Kernel Source via Repo
+        run: |
+          mkdir -p android-kernel
+          cd android-kernel
+          echo "Initializing repo for branch: ${{ env.KERNEL_MANIFEST_BRANCH }}"
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "${{ env.KERNEL_MANIFEST_BRANCH }}"
+          echo "Syncing repository..."
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+
+      - name: Integrate KernelSU & Configure Kernel
+        working-directory: android-kernel
+        run: |
+          set -e
+          echo "=== Integrating KernelSU ==="
+          if [ "${{ env.KSU_FLAVOR }}" = "KernelSU-Next" ]; then
+            SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+            DEFAULT_VER="next"
+          else
+            SETUP_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+            DEFAULT_VER="main"
+          fi
+
+          KSU_TARGET_VER="${{ env.KSU_VERSION }}"
+          if [ -z "$KSU_TARGET_VER" ]; then
+            KSU_TARGET_VER="$DEFAULT_VER"
+          fi
+
+          echo "Flavor: ${{ env.KSU_FLAVOR }}"
+          echo "Version: $KSU_TARGET_VER"
+          echo "Setup URL: $SETUP_URL"
+
+          # Execute setup.sh inside common/
+          cd common
+          curl -LSs "$SETUP_URL" | bash -s "$KSU_TARGET_VER"
+
+          # Inject CONFIG_KSU into defconfigs
+          echo "=== Injecting CONFIG_KSU into defconfigs ==="
+          if [ -f "arch/x86/configs/gki_defconfig" ]; then
+            grep -q "CONFIG_KSU" arch/x86/configs/gki_defconfig || echo "CONFIG_KSU=y" >> arch/x86/configs/gki_defconfig
+            grep -q "CONFIG_OVERLAY_FS" arch/x86/configs/gki_defconfig || echo "CONFIG_OVERLAY_FS=y" >> arch/x86/configs/gki_defconfig
+            grep -q "CONFIG_KPROBES" arch/x86/configs/gki_defconfig || echo "CONFIG_KPROBES=y" >> arch/x86/configs/gki_defconfig
+            echo "Appended CONFIG_KSU=y to common/arch/x86/configs/gki_defconfig"
+          fi
+
+          cd ..
+
+          # Append to virtual-device config fragments if they exist
+          find common-modules/virtual-device -name "*.fragment" 2>/dev/null | while read -r fragment; do
+            echo "Patching fragment: $fragment"
+            grep -q "CONFIG_KSU" "$fragment" || echo "CONFIG_KSU=y" >> "$fragment"
+          done
+
+          # Disable check_defconfig in Kleaf to prevent build errors due to defconfig drift
+          echo "=== Patching check_defconfig in Kleaf ==="
+          if [ -f "build/kernel/kleaf/common_kernels.bzl" ]; then
+            sed -i 's/"match"/"disabled"/g' build/kernel/kleaf/common_kernels.bzl
+            sed -i 's/"minimized"/"disabled"/g' build/kernel/kleaf/common_kernels.bzl
+            echo "Disabled check_defconfig in build/kernel/kleaf/common_kernels.bzl"
+          fi
+
+          find . -maxdepth 3 -type f -name "build.config*" -exec sed -i 's/POST_DEFCONFIG_CMDS="check_defconfig"/POST_DEFCONFIG_CMDS=""/g' {} + 2>/dev/null || true
+
+      - name: Build Kernel with Kleaf
+        working-directory: android-kernel
+        run: |
+          set -e
+          BAZEL_FLAGS=""
+          if [ "${{ env.USE_FAST_CONFIG }}" = "true" ]; then
+            BAZEL_FLAGS="--config=fast"
+          fi
+
+          if [ "${{ env.LTO_MODE }}" != "default" ]; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --lto=${{ env.LTO_MODE }}"
+          fi
+
+          BAZEL_FLAGS="${BAZEL_FLAGS} --config=stamp ${{ env.EXTRA_BAZEL_ARGS }}"
+
+          echo "=========================================="
+          echo "Running Bazel Build:"
+          echo "tools/bazel run ${BAZEL_FLAGS} ${{ env.BUILD_TARGET }} -- --dist_dir=out/dist --flat"
+          echo "=========================================="
+
+          tools/bazel run ${BAZEL_FLAGS} "${{ env.BUILD_TARGET }}" -- --dist_dir=out/dist --flat
+
+      - name: Package Artifacts
+        run: |
+          set -e
+          mkdir -p output/dist
+
+          # Locate bzImage
+          BZIMAGE_FOUND=""
+          if [ -f "android-kernel/out/dist/bzImage" ]; then
+            BZIMAGE_FOUND="android-kernel/out/dist/bzImage"
+          else
+            BZIMAGE_FOUND=$(find android-kernel/out -name "bzImage" | head -n 1)
+          fi
+
+          if [ -z "$BZIMAGE_FOUND" ] || [ ! -f "$BZIMAGE_FOUND" ]; then
+            echo "::error::bzImage was not found in output directory!"
+            exit 1
+          fi
+
+          echo "Found bzImage at: $BZIMAGE_FOUND"
+          cp "$BZIMAGE_FOUND" output/dist/bzImage
+
+          # Copy vmlinux and System.map if available for debugging/tracing
+          find android-kernel/out/dist -name "vmlinux" -exec cp {} output/dist/ \; 2>/dev/null || true
+          find android-kernel/out/dist -name "System.map" -exec cp {} output/dist/ \; 2>/dev/null || true
+
+          # Collect .ko kernel modules if present
+          mkdir -p output/modules
+          find android-kernel/out/dist -name "*.ko" -exec cp {} output/modules/ \; 2>/dev/null || true
+          if [ "$(ls -A output/modules 2>/dev/null)" ]; then
+            tar -czvf output/dist/virtual_device_modules.tar.gz -C output/modules .
+            rm -rf output/modules
+          else
+            rm -rf output/modules
+          fi
+
+          # Compute SHA-256
+          cd output/dist
+          sha256sum bzImage > bzImage.sha256sum
+          echo "=== Artifacts Summary ==="
+          ls -lh
+          echo "SHA256 of bzImage:"
+          cat bzImage.sha256sum
+
+      - name: Generate Build Summary
+        run: |
+          cd output/dist
+          BZ_SHA=$(awk '{print $1}' bzImage.sha256sum)
+          BZ_SIZE=$(ls -lh bzImage | awk '{print $5}')
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## 🎉 AVD KernelSU Build Succeeded!
+
+          | Item | Value |
+          | :--- | :--- |
+          | **Manifest Branch** | \`${{ env.KERNEL_MANIFEST_BRANCH }}\` |
+          | **KernelSU Flavor** | \`${{ env.KSU_FLAVOR }}\` (\`${{ env.KSU_VERSION }}\`) |
+          | **Target** | \`${{ env.BUILD_TARGET }}\` |
+          | **LTO Mode** | \`${{ env.LTO_MODE }}\` |
+          | **bzImage Size** | \`${BZ_SIZE}\` |
+          | **bzImage SHA256** | \`${BZ_SHA}\` |
+
+          ### 🚀 How to Launch AVD with this Kernel
+
+          **Option 1: Command Line Launch**
+          \`\`\`powershell
+          emulator @Pixel_10 -kernel path\\to\\bzImage -show-kernel
+          \`\`\`
+
+          **Option 2: Android Studio config.ini Persistence**
+          In \`~/.android/avd/<AVD_NAME>.avd/config.ini\`, set:
+          \`\`\`ini
+          kernel.path = path/to/bzImage
+          \`\`\`
+          EOF
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: avd-kernelsu-${{ env.KSU_FLAVOR }}-${{ github.run_id }}
+          path: |
+            output/dist/bzImage
+            output/dist/bzImage.sha256sum
+            output/dist/virtual_device_modules.tar.gz
+            output/dist/vmlinux
+            output/dist/System.map
+          retention-days: 90
+
+      - name: Create Release
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.create_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || format('v6.12-ksu-{0}', github.run_id) }}
+          name: AVD KernelSU ${{ env.KSU_FLAVOR }} (${{ env.KERNEL_MANIFEST_BRANCH }})
+          body: |
+            ## AVD KernelSU Custom Kernel Release
+            - **AOSP Kernel Branch**: `${{ env.KERNEL_MANIFEST_BRANCH }}`
+            - **KernelSU Flavor**: `${{ env.KSU_FLAVOR }}` (`${{ env.KSU_VERSION }}`)
+            - **Build Target**: `${{ env.BUILD_TARGET }}`
+            - **LTO**: `${{ env.LTO_MODE }}`
+            - **SHA256**: `$(awk '{print $1}' output/dist/bzImage.sha256sum)`
+          files: |
+            output/dist/bzImage
+            output/dist/bzImage.sha256sum
+            output/dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
