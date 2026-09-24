@@ -132,13 +132,21 @@ adb install KernelSU_Next_v3.4.0_33294-release.apk
 
 #### 3. 验证内核态 KernelSU（推荐，最可靠的验证方式）
 ```powershell
+adb root        # /data/adb 权限为 0700 root:root，必须先提权才能访问 ksud
 adb shell /data/adb/ksud debug version
 # 预期输出：Kernel Version: 33310
 
 adb shell /data/adb/ksud debug info
 # 预期输出：runtime_mode: built-in / lkm: false / uapi_version: 4
 ```
-可通过 `adb shell 'cat /proc/kallsyms | grep -E " (kernelsu_init|ksu_cred)$"'` 进一步确认 KernelSU 符号已内置到运行中的内核。
+若不加 `adb root`，会得到 `/data/adb/ksud: inaccessible or not found`（这是 `/data/adb` 目录权限导致，不代表 ksud 不存在）。
+
+可通过 `adb shell 'cat /proc/kallsyms | grep -E " (kernelsu_init|ksu_cred)$"'` 进一步确认 KernelSU 符号已内置到运行中的内核；另可查看 KernelSU 注入的 init.rc 钩子是否生效：
+```powershell
+adb shell dmesg | findstr /C:"/data/adb/ksud"
+# 预期：Command 'exec u:r:ksu:s0 root -- /data/adb/ksud services' ... succeeded
+#       Command 'exec u:r:ksu:s0 root -- /data/adb/ksud boot-completed' ... succeeded
+```
 
 #### 4. 关于 `adb shell su -v`
 - **它不是有效的验证手段**：模拟器 `google_apis` 镜像自带 `/system/xbin/su`（setuid root 的 AOSP 调试 su，位于只读系统分区 `dm-5`，与 KernelSU/Magisk 无关）。该 su 只接受 `su [uid] [gid] [命令]` 形式，因此 `su -v` / `su -c id` 必然报 `su: invalid uid/gid '-v'`；而它本身是 setuid root，不经 KernelSU 也可提权，故不能用来证明 KernelSU 生效。
