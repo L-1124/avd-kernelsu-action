@@ -113,8 +113,10 @@ jobs:
 
       - name: Install Dependencies & Setup Repo Tool
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl git python3 python3-pip bison flex libssl-dev libelf-dev bc rsync zip unzip tar
+          sudo apt-get install -y --no-install-recommends bison flex libssl-dev libelf-dev bc 2>/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bison flex libssl-dev libelf-dev bc
+          }
           mkdir -p ~/.bin
           curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
           chmod a+x ~/.bin/repo
@@ -130,7 +132,7 @@ jobs:
           echo "Initializing repo for branch: ${{ env.KERNEL_MANIFEST_BRANCH }}"
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "${{ env.KERNEL_MANIFEST_BRANCH }}"
           echo "Syncing repository..."
-          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+          repo sync -c -j12 --no-tags --no-clone-bundle
 
       - name: Integrate KernelSU & Configure Kernel
         working-directory: android-kernel
@@ -334,7 +336,7 @@ jobs:
             BAZEL_FLAGS="${BAZEL_FLAGS} --lto=${{ env.LTO_MODE }}"
           fi
 
-          BAZEL_FLAGS="${BAZEL_FLAGS} --config=stamp ${{ env.EXTRA_BAZEL_ARGS }}"
+          BAZEL_FLAGS="${BAZEL_FLAGS} --config=stamp --curses=no --show_progress_rate_limit=5 ${{ env.EXTRA_BAZEL_ARGS }}"
 
           DIST_DIR="$PWD/out/dist"
           BUILD_LOG="$PWD/out/bazel-build.log"
@@ -356,6 +358,72 @@ jobs:
           echo "KSU_DRIVER_VER=${KSU_DRIVER_VER}" >> $GITHUB_ENV
           echo "KSU_MGR_SIG=${KSU_MGR_SIG}" >> $GITHUB_ENV
 
+
+      - name: Download Matching Manager APK
+        run: |
+          set -e
+          mkdir -p output/dist
+          echo "=== Fetching Matching Manager APK for flavor: ${{ env.KSU_FLAVOR }} ==="
+
+          FLAVOR_LOWER="$(echo "${{ env.KSU_FLAVOR }}" | tr '[:upper:]' '[:lower:]')"
+          case "$FLAVOR_LOWER" in
+            "kernelsu-next")
+              KSU_COMMIT_SHA=""
+              for d in android-kernel/common/KernelSU-Next android-kernel/common/drivers/kernelsu android-kernel/KernelSU-Next; do
+                if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then
+                  KSU_COMMIT_SHA=$(git -C "$d" rev-parse HEAD 2>/dev/null || true)
+                  [ -n "$KSU_COMMIT_SHA" ] && break
+                fi
+              done
+              RUN_ID=""
+              if [ -n "$KSU_COMMIT_SHA" ]; then
+                echo "Looking for CI run matching commit: $KSU_COMMIT_SHA"
+                RUN_ID=$(gh run list --repo KernelSU-Next/KernelSU-Next --commit "$KSU_COMMIT_SHA" --workflow "Build Manager CI" --json databaseId,conclusion --jq '.[] | select(.conclusion=="success") | .databaseId' 2>/dev/null | head -n 1 || true)
+              fi
+              if [ -z "$RUN_ID" ]; then
+                echo "Falling back to latest successful Build Manager CI run on dev..."
+                RUN_ID=$(gh run list --repo KernelSU-Next/KernelSU-Next --branch dev --workflow "Build Manager CI" --status success --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+              fi
+              if [ -n "$RUN_ID" ]; then
+                echo "Downloading manager artifact from run $RUN_ID..."
+                gh run download "$RUN_ID" --repo KernelSU-Next/KernelSU-Next --name manager --dir output/dist/ 2>/dev/null || true
+              fi
+              ;;
+
+            "kernelsu")
+              echo "Downloading latest official KernelSU Manager release APK..."
+              gh release download --repo tiann/KernelSU --pattern "*.apk" --dir output/dist/ 2>/dev/null || true
+              ;;
+
+            "sukisu"|"sukisu-ultra")
+              echo "Downloading latest official SukiSU-Ultra Manager release APK..."
+              gh release download --repo SukiSU-Ultra/SukiSU-Ultra --pattern "*.apk" --dir output/dist/ 2>/dev/null || true
+              ;;
+
+            "resukisu")
+              echo "Finding latest successful Manager build for ReSukiSU..."
+              RUN_ID=$(gh run list --repo ReSukiSU/ReSukiSU --workflow "Build Manager" --status success --json databaseId --jq '.[0].databaseId' 2>/dev/null | head -n 1 || true)
+              if [ -n "$RUN_ID" ]; then
+                echo "Downloading Manager-release from ReSukiSU run $RUN_ID..."
+                gh run download "$RUN_ID" --repo ReSukiSU/ReSukiSU --name Manager-release --dir output/dist/ 2>/dev/null || true
+              fi
+              ;;
+          esac
+
+          # Move any nested APKs to output/dist/
+          find output/dist -name "*.apk" -exec mv {} output/dist/ \; 2>/dev/null || true
+          find output/dist -type d -empty -delete 2>/dev/null || true
+
+          MANAGER_APK=$(ls output/dist/*.apk 2>/dev/null | head -n 1 || true)
+          if [ -n "$MANAGER_APK" ]; then
+            echo "Successfully retrieved manager APK: $(basename "$MANAGER_APK")"
+            echo "MANAGER_APK_NAME=$(basename "$MANAGER_APK")" >> $GITHUB_ENV
+          else
+            echo "Notice: No manager APK could be retrieved automatically"
+            echo "MANAGER_APK_NAME=none" >> $GITHUB_ENV
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Package Artifacts
         run: |
           set -e
@@ -426,6 +494,7 @@ jobs:
           | **LTO Mode** | \`${{ env.LTO_MODE }}\` |
           | **bzImage Size** | \`${{ env.BZ_SIZE }}\` |
           | **bzImage SHA256** | \`${{ env.BZ_SHA256 }}\` |
+          | **Bundled Manager APK** | \`${{ env.MANAGER_APK_NAME }}\` |
 
           > 安装管理器 APK 时请选择 versionCode 与上方 **KernelSU driver version** 一致、且签名证书 SHA-256 等于 **Manager signature hash** 的版本，详见 README 第 7 节。
 
@@ -453,6 +522,7 @@ jobs:
             output/dist/System.map
             output/dist/bazel-build.log
             output/dist/ksu_susfs
+            output/dist/*.apk
           retention-days: 90
 
       - name: Create Release
@@ -483,4 +553,5 @@ jobs:
             output/dist/bzImage.sha256sum
             output/dist/*.tar.gz
             output/dist/ksu_susfs
+            output/dist/*.apk
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

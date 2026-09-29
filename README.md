@@ -92,7 +92,7 @@ Automated GitHub Actions CI pipeline to build an **x86_64 Android Emulator (AVD)
 | `susfs_branch` | `""` | SuSFS Git 分支（留空则根据内核版本自动匹配，如 `gki-android16-6.12`） |
 | `create_release` | `false` | 编译成功后是否自动发布 GitHub Release |
 
-编译耗时约 30~45 分钟。完成后在构建详情页的 **Artifacts** 下载产物包（包含 `bzImage`、`bzImage.sha256sum`、`vmlinux`、`System.map`、`virtual_device_modules.tar.gz` 与 `bazel-build.log`）。
+编译耗时约 25~35 分钟。完成后在构建详情页的 **Artifacts** 下载产物包（包含 `bzImage`、`bzImage.sha256sum`、配套管理器 `.apk`、`vmlinux`、`System.map`、`virtual_device_modules.tar.gz` 与 `bazel-build.log`）。
 
 ---
 
@@ -146,25 +146,12 @@ KernelSU 内核驱动在握手时对通信程序执行严格校验。管理器�
    * **SukiSU-Ultra**：使用 SukiSU 官方配套管理器 APK。
    * **ReSukiSU**：使用 ReSukiSU / SukiSU / MKSU / 原版 KernelSU 管理器（ReSukiSU 默认开启 `CONFIG_KSU_MULTI_MANAGER_SUPPORT=y` 多管理器支持）。
 
-#### 5.2 匹配 APK 的获取与校验
-官方 GitHub Release 的 APK 通常基于稳定 tag，版本号可能落后于处于开发主线的 `dev` 内核驱动。
-建议从 KernelSU-Next 官方仓库的 `Build Manager CI` 工作流中下载与内核 Commit 对应的产物：
-
-```powershell
-# 1. 查询匹配 commit 的 CI 运行记录
-gh run list --repo KernelSU-Next/KernelSU-Next --workflow "Build Manager CI" --branch dev --limit 5
-
-# 2. 下载 manager 构建产物
-gh run download <RUN_ID> --repo KernelSU-Next/KernelSU-Next --name manager
-
-# 3. 使用 apksigner 验证签名证书 SHA-256（必须与 Actions Job Summary 中的 Manager signature hash 一致）
-apksigner verify --print-certs KernelSU_Next_v3.4.0-..._33310-release.apk
-```
-
-校验通过后安装：
-```powershell
-adb install -r KernelSU_Next_v3.4.0-..._33310-release.apk
-```
+#### 5.2 自动捆绑与匹配校验
+* **CI 自动下载捆绑**：工作流现已实现**全自动检索并打包配套 Manager APK**。构建产物（Artifacts 及 Release）中会直接附带与内核变种及 Commit 严格匹配好的 `.apk` 文件，解压后即可直接通过 `adb install -r <Manager>.apk` 安装，无需手动去上游 CI 搜寻。
+* **手动校验说明（可选）**：若需自行验证 APK 签名证书，可使用 `apksigner` 确认证书 SHA-256 是否等于构建摘要中的 `Manager signature hash`：
+  ```powershell
+  apksigner verify --print-certs <Manager>.apk
+  ```
 
 ---
 
@@ -230,7 +217,8 @@ This repository provides an automated GitHub Actions CI workflow to compile an *
 - **Direct Kernel Boot**: Boot directly via emulator `-kernel bzImage`, or replace `<sysdir>\kernel-ranchu` in your Android SDK system images for persistent Android Studio integration.
 - **Zero Tampering**: No need for `-writable-system`, ramdisk unpacking, or system partition modification.
 - **Full Driver Compatibility**: Builds the virtual device target (`//common-modules/virtual-device:virtual_device_x86_64_dist`), ensuring complete binary KMI compatibility with stock AVD `.ko` drivers.
-- **CI Resource Optimized**: Maximize build space step frees 55GB+ disk space, allocates 8GB swap, and uses `--lto=none --config=fast` to avoid runner OOM crashes.
+- **CI Resource Optimized**: Maximize build space step frees 55GB+ disk space, allocates 8GB swap, uses `-j12` network sync, and uses `--lto=none --config=fast --show_progress_rate_limit=5` to prevent runner OOM crashes and save 3-5 minutes.
+- **Auto-Bundled Manager APK**: Automatically queries and packages the matching Manager APK directly into the build artifacts/releases, eliminating version/signature mismatch headaches.
 - **SuSFS Root Hiding Support**: Optional integration of SuSFS (`enable_susfs`), including automatic kernel patch injection and pre-compiled static `ksu_susfs` userspace binary for x86_64.
 
 ### Technical Lineage
