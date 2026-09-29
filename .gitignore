@@ -23,3 +23,6 @@ bzImage
 
 # Repo tool artifacts
 .repo/
+
+# Local CI downloads
+downloads/
