@@ -9,15 +9,17 @@ name: Build AVD KernelSU
         default: 'common-android16-6.12-2025-09'
         type: string
       ksu_flavor:
-        description: 'KernelSU Variant (KernelSU-Next or KernelSU)'
+        description: 'KernelSU Variant (KernelSU-Next, KernelSU, SukiSU-Ultra, ReSukiSU)'
         required: true
         default: 'KernelSU-Next'
         type: choice
         options:
           - 'KernelSU-Next'
           - 'KernelSU'
+          - 'SukiSU-Ultra'
+          - 'ReSukiSU'
       ksu_version:
-        description: 'KernelSU branch / tag / commit SHA (KernelSU-Next: dev; KernelSU: main)'
+        description: 'KernelSU branch / tag / commit SHA (KernelSU-Next: dev; Others: main)'
         required: true
         default: 'dev'
         type: string
@@ -45,6 +47,16 @@ name: Build AVD KernelSU
         required: false
         default: '--jobs=4'
         type: string
+      enable_susfs:
+        description: 'Integrate SuSFS (Kernel-level root hiding)'
+        required: false
+        default: false
+        type: boolean
+      susfs_branch:
+        description: 'SuSFS git branch (empty = auto-detect based on kernel branch, e.g. gki-android16-6.12)'
+        required: false
+        default: ''
+        type: string
       create_release:
         description: 'Publish as GitHub Release'
         required: false
@@ -64,11 +76,13 @@ jobs:
     env:
       KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_manifest_branch || 'common-android16-6.12-2025-09' }}
       KSU_FLAVOR: ${{ inputs.ksu_flavor || 'KernelSU-Next' }}
-      KSU_VERSION: ${{ inputs.ksu_version || 'next' }}
+      KSU_VERSION: ${{ inputs.ksu_version || 'dev' }}
       BUILD_TARGET: ${{ inputs.build_target || '//common-modules/virtual-device:virtual_device_x86_64_dist' }}
       LTO_MODE: ${{ inputs.lto_mode || 'none' }}
       USE_FAST_CONFIG: ${{ inputs.use_fast_config != false }}
       EXTRA_BAZEL_ARGS: ${{ inputs.extra_bazel_args || '--jobs=4' }}
+      ENABLE_SUSFS: ${{ inputs.enable_susfs == true }}
+      SUSFS_BRANCH: ${{ inputs.susfs_branch || '' }}
 
     steps:
       - name: Maximize Build Space
@@ -122,19 +136,37 @@ jobs:
         working-directory: android-kernel
         run: |
           set -eo pipefail
-          echo "=== Integrating KernelSU ==="
-          if [ "${{ env.KSU_FLAVOR }}" = "KernelSU-Next" ]; then
-            REPO_SLUG="KernelSU-Next/KernelSU-Next"
-            DEFAULT_REF="dev"
-          else
-            REPO_SLUG="tiann/KernelSU"
-            DEFAULT_REF="main"
-          fi
+          echo "=== Integrating KernelSU Variant ==="
+          case "$(echo "${{ env.KSU_FLAVOR }}" | tr '[:upper:]' '[:lower:]')" in
+            "kernelsu-next")
+              REPO_SLUG="KernelSU-Next/KernelSU-Next"
+              DEFAULT_REF="dev"
+              ;;
+            "kernelsu")
+              REPO_SLUG="tiann/KernelSU"
+              DEFAULT_REF="main"
+              ;;
+            "sukisu"|"sukisu-ultra")
+              REPO_SLUG="SukiSU-Ultra/SukiSU-Ultra"
+              DEFAULT_REF="main"
+              ;;
+            "resukisu")
+              REPO_SLUG="ReSukiSU/ReSukiSU"
+              DEFAULT_REF="main"
+              ;;
+            *)
+              REPO_SLUG="${{ env.KSU_FLAVOR }}"
+              DEFAULT_REF="main"
+              ;;
+          esac
           REPO_URL="https://github.com/$REPO_SLUG"
 
           KSU_TARGET_VER="${{ env.KSU_VERSION }}"
+          # If user left 'dev' while selecting a flavor whose default branch is 'main', adapt to default
+          if [ "$DEFAULT_REF" != "dev" ] && [ "$KSU_TARGET_VER" = "dev" ]; then
+            KSU_TARGET_VER="$DEFAULT_REF"
+          fi
           [ -n "$KSU_TARGET_VER" ] || KSU_TARGET_VER="$DEFAULT_REF"
-
           # Fail loudly on a nonexistent ref instead of silently falling back to the
           # default branch (which would build an unexpected KernelSU commit).
           # Pure 40-char hex values are treated as commit SHAs and skipped here.
@@ -171,10 +203,10 @@ jobs:
 
           # Ensure ccflags is set in KernelSU Kbuild & Makefile for x86_64 dynamic dispatcher
           if [ -f "drivers/kernelsu/Kbuild" ]; then
-            grep -q "CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" drivers/kernelsu/Kbuild || echo "ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" >> drivers/kernelsu/Kbuild
+            grep -q -- "-DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" drivers/kernelsu/Kbuild || echo "ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=1" >> drivers/kernelsu/Kbuild
           fi
           if [ -f "drivers/kernelsu/Makefile" ]; then
-            grep -q "CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" drivers/kernelsu/Makefile || echo "ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" >> drivers/kernelsu/Makefile
+            grep -q -- "-DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" drivers/kernelsu/Makefile || echo "ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=1" >> drivers/kernelsu/Makefile
           fi
 
           # Safeguard: Neutralize fatal indirect syscall checks for x86 GKI
@@ -188,6 +220,97 @@ jobs:
             grep -q "CONFIG_KSU" "$fragment" || echo "CONFIG_KSU=y" >> "$fragment"
             grep -q "CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" "$fragment" || echo "CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y" >> "$fragment"
           done
+
+          # Integrate SuSFS if enabled
+          if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
+            echo "=== Integrating SuSFS ==="
+            SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+            SUSFS_TARGET_BRANCH="${{ env.SUSFS_BRANCH }}"
+            if [ -z "$SUSFS_TARGET_BRANCH" ]; then
+              case "${{ env.KERNEL_MANIFEST_BRANCH }}" in
+                *6.12*) SUSFS_TARGET_BRANCH="gki-android16-6.12" ;;
+                *6.6*)  SUSFS_TARGET_BRANCH="gki-android15-6.6" ;;
+                *6.1*)  SUSFS_TARGET_BRANCH="gki-android14-6.1" ;;
+                *5.15*) SUSFS_TARGET_BRANCH="gki-android14-5.15" ;;
+                *5.10*) SUSFS_TARGET_BRANCH="gki-android13-5.10" ;;
+                *)      SUSFS_TARGET_BRANCH="gki-android16-6.12" ;;
+              esac
+            fi
+            echo "SuSFS target branch: $SUSFS_TARGET_BRANCH"
+            git clone --depth=1 -b "$SUSFS_TARGET_BRANCH" "$SUSFS_REPO" susfs4ksu
+
+            # Copy kernel-level susfs files to common/
+            cp -r susfs4ksu/kernel_patches/fs/* common/fs/
+            cp -r susfs4ksu/kernel_patches/include/linux/* common/include/linux/
+
+            # Apply kernel patch to common/
+            PATCH_FILE=$(find susfs4ksu/kernel_patches -name "50_add_susfs_in_*.patch" | head -n 1)
+            if [ -n "$PATCH_FILE" ] && [ -f "$PATCH_FILE" ]; then
+              echo "Applying SuSFS kernel patch: $PATCH_FILE"
+              (cd common && patch -p1 -N -t < "../$PATCH_FILE") || true
+            fi
+
+            # Apply KernelSU-side patch if required (ReSukiSU already has native inline hooks)
+            KSU_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+            if [ -f "$KSU_PATCH" ]; then
+              for dir in common/drivers/kernelsu common/KernelSU common/KernelSU-Next; do
+                if [ -d "$dir" ] && [ ! -d "$dir/.git" ]; then
+                  dir_real=$(readlink -f "$dir" || echo "$dir")
+                  if [ -f "$dir_real/Kconfig" ] && ! grep -q "KSU_SUSFS" "$dir_real/Kconfig"; then
+                    echo "Applying SuSFS hook patch to $dir..."
+                    (cd "$dir_real" && patch -p1 -N -t < "$(pwd)/$KSU_PATCH") || true
+                  fi
+                  break
+                elif [ -d "$dir" ]; then
+                  if [ -f "$dir/kernel/Kconfig" ] && ! grep -q "KSU_SUSFS" "$dir/kernel/Kconfig"; then
+                    echo "Applying SuSFS hook patch to $dir..."
+                    (cd "$dir" && patch -p1 -N -t < "$(pwd)/$KSU_PATCH") || true
+                  fi
+                  break
+                fi
+              done
+            fi
+
+            # Enable CONFIG_KSU_SUSFS in defconfigs and virtual-device fragments
+            echo "=== Enabling CONFIG_KSU_SUSFS configs ==="
+            for cfg in \
+              "CONFIG_KSU_SUSFS=y" \
+              "CONFIG_KSU_SUSFS_SUS_PATH=y" \
+              "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
+              "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" \
+              "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" \
+              "CONFIG_KSU_SUSFS_SUS_KSTAT=y" \
+              "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" \
+              "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" \
+              "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" \
+              "CONFIG_KSU_SUSFS_ENABLE_LOG=y" \
+              "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" \
+              "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" \
+              "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" \
+              "CONFIG_KSU_SUSFS_SUS_SU=y"; do
+              if [ -f "common/arch/x86/configs/gki_defconfig" ]; then
+                grep -q "$cfg" "common/arch/x86/configs/gki_defconfig" || echo "$cfg" >> "common/arch/x86/configs/gki_defconfig"
+              fi
+              find common-modules/virtual-device -name "*.fragment" 2>/dev/null | while read -r fragment; do
+                grep -q "$cfg" "$fragment" || echo "$cfg" >> "$fragment"
+              done
+            done
+
+            # Remove abi_gki_protected_exports to prevent module build breaks
+            rm -f common/android/abi_gki_protected_exports_* 2>/dev/null || true
+
+            # Build static ksu_susfs tool for x86_64 if gcc is present
+            if [ -d "susfs4ksu/ksu_susfs" ]; then
+              echo "=== Building ksu_susfs userspace tool ==="
+              mkdir -p out/dist
+              gcc -static -O2 -I"susfs4ksu/ksu_susfs/jni/includes" -I"susfs4ksu/ksu_susfs/jni/features" \
+                susfs4ksu/ksu_susfs/jni/main.c susfs4ksu/ksu_susfs/jni/susfs_utils.c susfs4ksu/ksu_susfs/jni/features/*.c \
+                -o "out/dist/ksu_susfs" 2>/dev/null || echo "Host gcc failed to build ksu_susfs, skipping standalone binary"
+            fi
+
+            rm -rf susfs4ksu
+            echo "SuSFS integration finished."
+          fi
           # Disable check_defconfig in Kleaf to prevent build errors due to defconfig drift
           echo "=== Patching check_defconfig in Kleaf ==="
           if [ -f "build/kernel/kleaf/common_kernels.bzl" ]; then
@@ -225,8 +348,9 @@ jobs:
 
           # Report the KernelSU driver version and the manager APK signature the kernel
           # expects, so the matching manager APK can be selected and verified.
-          KSU_DRIVER_VER=$(grep -m1 -oE 'KernelSU(-Next)? version: [0-9]+' "$BUILD_LOG" | awk '{print $NF}' || true)
-          KSU_MGR_SIG=$(grep -m1 -oE 'Manager signature hash: [0-9a-f]{64}' "$BUILD_LOG" | awk '{print $NF}' || true)
+          KSU_DRIVER_VER=$(grep -m1 -oE '(KernelSU(-Next)?|SukiSU(-Ultra)?|ReSukiSU) version( code)?: [0-9]+' "$BUILD_LOG" | awk '{print $NF}' || true)
+          [ -n "$KSU_DRIVER_VER" ] || KSU_DRIVER_VER=$(grep -m1 -oE 'version( code)?: [0-9]+' "$BUILD_LOG" | awk '{print $NF}' || true)
+          KSU_MGR_SIG=$(grep -m1 -oE '(Manager signature hash|signature hash): [0-9a-f]{64}' "$BUILD_LOG" | awk '{print $NF}' || true)
           echo "KernelSU driver version : ${KSU_DRIVER_VER:-unknown}"
           echo "Manager signature hash  : ${KSU_MGR_SIG:-unknown}"
           echo "KSU_DRIVER_VER=${KSU_DRIVER_VER}" >> $GITHUB_ENV
@@ -270,6 +394,10 @@ jobs:
           # Keep the build log: it records the KernelSU driver version and the manager
           # signature hash the kernel expects.
           cp android-kernel/out/bazel-build.log output/dist/bazel-build.log 2>/dev/null || true
+          # Copy ksu_susfs if built
+          if [ -f "android-kernel/out/dist/ksu_susfs" ]; then
+            cp "android-kernel/out/dist/ksu_susfs" output/dist/ksu_susfs
+          fi
 
           # Compute SHA-256
           cd output/dist
@@ -285,7 +413,7 @@ jobs:
       - name: Generate Build Summary
         run: |
           cat << EOF >> $GITHUB_STEP_SUMMARY
-          ## 🎉 AVD KernelSU Build Succeeded!
+          ## AVD KernelSU Build Succeeded
 
           | Item | Value |
           | :--- | :--- |
@@ -293,6 +421,7 @@ jobs:
           | **KernelSU Flavor** | \`${{ env.KSU_FLAVOR }}\` (\`${{ env.KSU_VERSION }}\`) |
           | **KernelSU driver version** | \`${{ env.KSU_DRIVER_VER }}\` |
           | **Manager signature hash** | \`${{ env.KSU_MGR_SIG }}\` |
+          | **SuSFS Integrated** | \`${{ env.ENABLE_SUSFS }}\` |
           | **Target** | \`${{ env.BUILD_TARGET }}\` |
           | **LTO Mode** | \`${{ env.LTO_MODE }}\` |
           | **bzImage Size** | \`${{ env.BZ_SIZE }}\` |
@@ -300,18 +429,16 @@ jobs:
 
           > 安装管理器 APK 时请选择 versionCode 与上方 **KernelSU driver version** 一致、且签名证书 SHA-256 等于 **Manager signature hash** 的版本，详见 README 第 7 节。
 
-          ### 🚀 How to Launch AVD with this Kernel
+          ### How to Launch AVD with this Kernel
 
           **Option 1: Command Line Launch**
-          \`\`\`powershell
-          emulator @Pixel_10 -kernel path\\to\\bzImage -show-kernel
-          \`\`\`
+          ```powershell
+          emulator @Pixel_10 -kernel path\to\bzImage -show-kernel
+          ```
 
-          **Option 2: Android Studio config.ini Persistence**
-          In \`~/.android/avd/<AVD_NAME>.avd/config.ini\`, set:
-          \`\`\`ini
-          kernel.path = path/to/bzImage
-          \`\`\`
+          **Option 2: Android Studio Persistence**
+          Replace `<sysdir>\kernel-ranchu` in your SDK system-images folder with `bzImage` and remove/rename `snapshots\default_boot`.
+          Editing `kernel.path` in `config.ini` is overridden by the emulator and does not take effect.
           EOF
 
       - name: Upload Kernel Artifacts
@@ -325,6 +452,7 @@ jobs:
             output/dist/vmlinux
             output/dist/System.map
             output/dist/bazel-build.log
+            output/dist/ksu_susfs
           retention-days: 90
 
       - name: Create Release
@@ -343,7 +471,7 @@ jobs:
             - **LTO**: `${{ env.LTO_MODE }}`
             - **bzImage Size**: `${{ env.BZ_SIZE }}`
             - **bzImage SHA256**: `${{ env.BZ_SHA256 }}`
-
+            - **SuSFS Integrated**: `${{ env.ENABLE_SUSFS }}`
             > Use a manager APK whose versionCode equals the KernelSU driver version above and
             > whose signing certificate SHA-256 equals the manager signature hash above.
 
@@ -354,5 +482,5 @@ jobs:
             output/dist/bzImage
             output/dist/bzImage.sha256sum
             output/dist/*.tar.gz
-        env:
+            output/dist/ksu_susfs
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
