@@ -211,9 +211,6 @@ jobs:
             grep -q -- "-DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER" drivers/kernelsu/Makefile || echo "ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=1" >> drivers/kernelsu/Makefile
           fi
 
-          # Safeguard: Neutralize fatal indirect syscall checks for x86 GKI
-          find drivers/kernelsu -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's/#error "FATAL: Your kernel is missing the indirect syscall bypass patches!"/\/* bypassed indirect syscall check *\//g' {} + 2>/dev/null || true
-
           cd ..
 
           # Append to virtual-device config fragments if they exist
